@@ -93,36 +93,67 @@ namespace PatchManager
         private async void CreatePatch()
         {
             InterfaceLock(false);
+            Error = false;
+            TotalUpload = 0;
+            TotalProgress = 0;
+            CurrentProgress = 0;
+            TotalProgressPercent = 0;
+            Speed = 0;
+            TotalProgressBar.EditValue = 0;
 
             Progress<string> progress = new Progress<string>(s => StatusLabel.Text = s);
 
-            List<PatchInformation> currentVersion = await Task.Run(() => CreateVersion(progress));
-            List<PatchInformation> liveVersion = await Task.Run(() => GetPatchInformation(progress));
-
-            List<PatchInformation> patch = await Task.Run(() => CalculatePatch(currentVersion, liveVersion, progress));
-
-            Task task = Task.Run(() => UploadFiles(patch, progress));
-
-            while (!task.IsCompleted)
+            try
             {
-                await Task.Delay(TimeSpan.FromSeconds(1));
+                List<PatchInformation> currentVersion = await Task.Run(() => CreateVersion(progress));
+                List<PatchInformation> liveVersion = await Task.Run(() => GetPatchInformation(progress));
+
+                List<PatchInformation> patch = await Task.Run(() => CalculatePatch(currentVersion, liveVersion, progress));
+
+                Task uploadTask = Task.Run(() => UploadFiles(patch, progress));
+
+                while (!uploadTask.IsCompleted)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1));
+                    CreateSizeLabel();
+                }
+
+                await uploadTask;
                 CreateSizeLabel();
+
+                if (!Error)
+                    SaveVersion(currentVersion);
+
+                if (Directory.Exists(".\\Patch\\"))
+                    Directory.Delete(".\\Patch\\", true);
+
+                if (Directory.Exists(TempDownloadDirectory))
+                    Directory.Delete(TempDownloadDirectory, true);
+
+                if (Error)
+                {
+                    StatusLabel.Text = "Patch failed.";
+                    UploadSizeLabel.Text = "Patch failed.";
+                    UploadSpeedLabel.Text = "Patch failed.";
+                    return;
+                }
+
+                StatusLabel.Text = "Complete.";
+                UploadSizeLabel.Text = "Complete.";
+                UploadSpeedLabel.Text = "Complete.";
             }
-
-            InterfaceLock(true);
-
-            if (!Error)
-                SaveVersion(currentVersion);
-
-            if (Directory.Exists(".\\Patch\\"))
-                Directory.Delete(".\\Patch\\", true);
-
-            if (Directory.Exists(TempDownloadDirectory))
-                Directory.Delete(TempDownloadDirectory, true);
-
-            StatusLabel.Text = "Complete.";
-            UploadSizeLabel.Text = "Complete.";
-            UploadSpeedLabel.Text = "Complete.";
+            catch (Exception ex)
+            {
+                Error = true;
+                StatusLabel.Text = "Patch failed.";
+                UploadSizeLabel.Text = "Patch failed.";
+                UploadSpeedLabel.Text = "Patch failed.";
+                MessageBox.Show(ex.Message, "Patch Failed", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+            }
+            finally
+            {
+                InterfaceLock(true);
+            }
         }
 
         private void CreateSizeLabel()
@@ -392,6 +423,7 @@ namespace PatchManager
                 };
 
                 var result = session.PutFileToDirectory(tempFilePath, rootPath, options: transferOptions);
+                result.Check();
             }
         }
 

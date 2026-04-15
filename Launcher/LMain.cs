@@ -10,6 +10,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -20,10 +21,13 @@ namespace Launcher
         public const string PListFileName = "PList.Bin";
         public const string ClientPath = ".\\";
         public const string ClientFileName = "Zircon.exe";
+        private const int MinimumConcurrentDownloads = 1;
+        private const int MaximumConcurrentDownloads = 8;
 
         public DateTime LastSpeedCheck;
         public long TotalDownload, TotalProgress, CurrentProgress, LastDownloadProcess;
         public bool NeedUpdate;
+        private volatile bool PatchFailed;
 
         public static bool HasError;
 
@@ -64,6 +68,7 @@ namespace Launcher
             TotalProgressBar.EditValue = 0;
             LastSpeedCheck = Time.Now;
             NeedUpdate = false;
+            PatchFailed = false;
 
             Progress<string> progress = new Progress<string>(s => StatusLabel.Text = s);
 
@@ -83,15 +88,30 @@ namespace Launcher
             StatusLabel.Text = "Downloading";
             CreateSizeLabel();
 
-            Task task = DownloadPatch(patch, progress, new Progress<int>(percent =>
-            {
-                // Update progress bar or label with the percentage downloaded
-                CreateSizeLabel();
-            }));
+            Task<bool> patchTask = DownloadPatch(patch, progress);
 
-            await task;
+            while (!patchTask.IsCompleted)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+                CreateSizeLabel();
+            }
+
+            bool patchSuccess = await patchTask;
 
             CreateSizeLabel();
+
+            if (!patchSuccess || PatchFailed)
+            {
+                if (Directory.Exists(ClientPath + "Patch\\"))
+                    Directory.Delete(ClientPath + "Patch\\", true);
+
+                StatusLabel.Text = "Patch Failed";
+                DownloadSizeLabel.Text = "Patch failed.";
+                DownloadSpeedLabel.Text = "Patch failed.";
+                RepairButton.Enabled = true;
+                StartGameButton.Enabled = false;
+                return;
+            }
 
             SaveVersion(liveVersion);
 
@@ -125,7 +145,7 @@ namespace Launcher
             const decimal MB = KB * 1024;
             const decimal GB = MB * 1024;
 
-            long progress = TotalProgress + CurrentProgress;
+            long progress = Interlocked.Read(ref CurrentProgress);
 
             StringBuilder text = new StringBuilder();
 
@@ -152,7 +172,8 @@ namespace Launcher
             if (TotalDownload > 0)
                 TotalProgressBar.EditValue = Math.Max(0, Math.Min(100, (int)(progress * 100 / TotalDownload)));
 
-            long speed = (progress - LastDownloadProcess) * TimeSpan.TicksPerSecond / (Time.Now.Ticks - LastSpeedCheck.Ticks); //May cause errors?
+            long elapsedTicks = Time.Now.Ticks - LastSpeedCheck.Ticks;
+            long speed = elapsedTicks > 0 ? (progress - LastDownloadProcess) * TimeSpan.TicksPerSecond / elapsedTicks : 0;
             LastDownloadProcess = progress;
 
             if (speed > GB)
@@ -287,22 +308,30 @@ namespace Launcher
 
         }
 
-        private async Task DownloadPatch(List<PatchInformation> patch, IProgress<string> progress, IProgress<int> downloadProgress)
+        private async Task<bool> DownloadPatch(List<PatchInformation> patch, IProgress<string> progress)
         {
-            List<Task> tasks = new List<Task>();
+            if (patch.Count == 0) return true;
 
-            foreach (PatchInformation file in patch)
+            int completedCount = 0;
+            int maxConcurrency = Math.Min(MaximumConcurrentDownloads, Math.Max(MinimumConcurrentDownloads, Config.MaxConcurrentDownloads));
+
+            using HttpClient client = CreateHttpClient();
+            using SemaphoreSlim throttler = new SemaphoreSlim(maxConcurrency);
+
+            Task<bool>[] tasks = new Task<bool>[patch.Count];
+
+            for (int i = 0; i < patch.Count; i++)
             {
-                if (!await Download(file, downloadProgress)) continue;
-
-                tasks.Add(Extract(file));
+                PatchInformation file = patch[i];
+                tasks[i] = DownloadAndExtract(file, client, throttler, progress, () =>
+                {
+                    int finished = Interlocked.Increment(ref completedCount);
+                    progress.Report($"Patched files: {finished} of {patch.Count}");
+                });
             }
 
-            if (tasks.Count == 0) return;
-
-            progress.Report("Downloaded, Extracting.");
-
-            await Task.WhenAll(tasks);
+            bool[] results = await Task.WhenAll(tasks);
+            return results.All(x => x);
         }
 
 
@@ -319,61 +348,82 @@ namespace Launcher
             }
         }
 
-        private async Task<bool> Download(PatchInformation file, IProgress<int> progress)
+        private HttpClient CreateHttpClient()
+        {
+            HttpClient client = new HttpClient();
+
+            if (Config.UseLogin)
+            {
+                byte[] byteArray = Encoding.ASCII.GetBytes($"{Config.Username}:{Config.Password}");
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(byteArray));
+            }
+
+            return client;
+        }
+
+        private async Task<bool> DownloadAndExtract(PatchInformation file, HttpClient client, SemaphoreSlim throttler, IProgress<string> progress, Action onCompleted)
+        {
+            await throttler.WaitAsync();
+
+            try
+            {
+                if (!await Download(file, client))
+                {
+                    PatchFailed = true;
+                    return false;
+                }
+
+                if (!await Extract(file))
+                {
+                    PatchFailed = true;
+                    return false;
+                }
+
+                onCompleted();
+                return true;
+            }
+            finally
+            {
+                throttler.Release();
+            }
+        }
+
+        private async Task<bool> Download(PatchInformation file, HttpClient client)
         {
             string webFileName = file.FileName.Replace("\\", "-") + ".gz";
 
             try
             {
-                using (HttpClient client = new HttpClient())
+                using HttpResponseMessage response = await client.GetAsync(Config.Host + webFileName, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+
+                string patchDirectory = ClientPath + "Patch\\";
+                if (!Directory.Exists(patchDirectory))
+                    Directory.CreateDirectory(patchDirectory);
+
+                using Stream contentStream = await response.Content.ReadAsStreamAsync();
+                using FileStream fileStream = new FileStream($"{patchDirectory}{webFileName}", FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
+
+                byte[] buffer = new byte[81920];
+                int bytesRead;
+                while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                 {
-                    if (Config.UseLogin)
-                    {
-                        var byteArray = Encoding.ASCII.GetBytes($"{Config.Username}:{Config.Password}");
-                        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(byteArray));
-                    }
-
-                    client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
-                    HttpResponseMessage response = await client.GetAsync(Config.Host + webFileName, HttpCompletionOption.ResponseHeadersRead);
-
-                    using (Stream contentStream = await response.Content.ReadAsStreamAsync())
-                    {
-                        response.EnsureSuccessStatusCode();
-
-                        if (!Directory.Exists(ClientPath + "Patch\\"))
-                            Directory.CreateDirectory(ClientPath + "Patch\\");
-
-                        using (FileStream fileStream = new FileStream($"{ClientPath}Patch\\{webFileName}", FileMode.Create, FileAccess.Write, FileShare.None, 8192, true))
-                        {
-                            long totalBytes = response.Content.Headers.ContentLength ?? -1;
-                            long totalDownloadedBytes = 0;
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                            {
-                                await fileStream.WriteAsync(buffer, 0, bytesRead);
-                                totalDownloadedBytes += bytesRead;
-                                if (totalBytes > 0)
-                                    progress.Report((int)(totalDownloadedBytes * 100 / totalBytes));
-                            }
-                        }
-                    }
-
-                    CurrentProgress = 0;
-                    TotalProgress += file.CompressedLength;
-
-                    return true;
+                    await fileStream.WriteAsync(buffer, 0, bytesRead);
+                    Interlocked.Add(ref CurrentProgress, bytesRead);
                 }
+
+                return true;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                file.CheckSum = new byte[8];
+                file.CheckSum = Array.Empty<byte>();
+                return ReportPatchFailure(file, ex);
             }
 
             return false;
         }
 
-        private async Task Extract(PatchInformation file)
+        private async Task<bool> Extract(PatchInformation file)
         {
             string webFileName = file.FileName.Replace("\\", "-") + ".gz";
 
@@ -391,19 +441,37 @@ namespace Launcher
                 if (File.Exists(toPath)) File.Delete(toPath);
 
                 await Decompress($"{ClientPath}Patch\\{webFileName}", toPath);
+                return true;
             }
             catch (UnauthorizedAccessException ex)
             {
-                file.CheckSum = new byte[8];
+                file.CheckSum = Array.Empty<byte>();
 
-                if (HasError) return;
+                if (HasError) return false;
                 HasError = true;
                 MessageBox.Show(ex.Message + "\n\nFile might be in use, please make sure the game is closed.", "File Error", MessageBoxButtons.OK);
+                return false;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                file.CheckSum = new byte[8];
+                file.CheckSum = Array.Empty<byte>();
+                return ReportPatchFailure(file, ex);
             }
+
+            return false;
+        }
+
+        private bool ReportPatchFailure(PatchInformation file, Exception ex)
+        {
+            if (HasError) return false;
+
+            HasError = true;
+            BeginInvoke(new Action(() =>
+            {
+                MessageBox.Show($"Failed to patch {file.FileName}\n\n{ex.Message}", "Patch Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }));
+
+            return false;
         }
         private static async Task Decompress(string sourceFile, string destFile)
         {

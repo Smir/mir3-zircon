@@ -901,6 +901,7 @@ namespace Client.Envir
 
         public static int ErrorCount;
         private static string LastError;
+        private static int FatalErrorCount;
         public static void SaveError(string ex)
         {
             try
@@ -925,6 +926,37 @@ namespace Client.Envir
         {
             SaveError(ex.ToString());
             if (Config.SentryEnabled) SentrySdk.CaptureException(ex);
+        }
+
+        public static void HandleFatalException(Exception ex, string source)
+        {
+            if (ex == null) return;
+            if (Interlocked.Exchange(ref FatalErrorCount, 1) != 0) return;
+
+            SaveException(ex);
+
+            try
+            {
+                Connection?.SendClientErrorReport(ex);
+                Thread.Sleep(250);
+            }
+            catch
+            {
+            }
+
+            string message =
+                $"Zircon hit a fatal error in {source}.{Environment.NewLine}{Environment.NewLine}" +
+                $"{ex.Message}{Environment.NewLine}{Environment.NewLine}" +
+                $"A report has been saved locally and an upload to the server was attempted.";
+
+            try
+            {
+                MessageBox.Show(message, "Zircon Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch
+            {
+            }
+
         }
 
         public static void Unload()

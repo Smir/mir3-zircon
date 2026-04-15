@@ -55,6 +55,28 @@ namespace Server.Envir
             }
         }
 
+        public static void LogException(string context, Exception ex, bool hardLog = true)
+        {
+            Log($"{context}: {ex.Message}", hardLog);
+            Log(ex.ToString(), hardLog);
+        }
+
+        public static void SaveTextReport(string directory, string prefix, string contents)
+        {
+            try
+            {
+                if (!Directory.Exists(directory))
+                    Directory.CreateDirectory(directory);
+
+                string fileName = $"{prefix}-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}-{Guid.NewGuid():N}.txt";
+                File.WriteAllText(Path.Combine(directory, fileName), contents);
+            }
+            catch (Exception ex)
+            {
+                LogException("Failed to save text report", ex);
+            }
+        }
+
         public static ConcurrentQueue<string> DisplayChatLogs = new ConcurrentQueue<string>();
         public static ConcurrentQueue<string> ChatLogs = new ConcurrentQueue<string>();
         public static void LogChat(string log)
@@ -379,6 +401,75 @@ namespace Server.Envir
 
             EnvirThread = new Thread(() => EnvirLoop()) { IsBackground = true };
             EnvirThread.Start();
+        }
+
+        private static void HandleConnectionFailure(SConnection connection, Exception ex, string phase)
+        {
+            string context = $"Connection failure during {phase}. Session: {connection?.SessionID}, Account: {connection?.Account?.EMailAddress}, Character: {connection?.Player?.Name}, IP: {connection?.IPAddress}";
+            LogException(context, ex);
+
+            try
+            {
+                connection?.SendDisconnect(new G.Disconnect { Reason = DisconnectReason.Crashed });
+                connection?.Disconnect();
+            }
+            catch (Exception disconnectEx)
+            {
+                LogException("Failed to disconnect crashed connection", disconnectEx);
+            }
+        }
+
+        private static void HandlePlayerFailure(PlayerObject player, Exception ex, string phase)
+        {
+            string context = $"Player failure during {phase}. Account: {player?.Character?.Account?.EMailAddress}, Character: {player?.Name}, Map: {player?.CurrentMap?.Info?.Description}";
+            LogException(context, ex);
+
+            try
+            {
+                player?.Connection?.SendDisconnect(new G.Disconnect { Reason = DisconnectReason.Crashed });
+                player?.Connection?.Disconnect();
+            }
+            catch (Exception disconnectEx)
+            {
+                LogException("Failed to disconnect crashed player", disconnectEx);
+            }
+        }
+
+        private static void HandleMapFailure(Map map, Exception ex, string phase)
+        {
+            string context = $"Map failure during {phase}. Map: {map?.Info?.Description}";
+            LogException(context, ex);
+        }
+
+        private static void HandleLoopFailure(string phase, Exception ex)
+        {
+            LogException($"Server loop failure during {phase}", ex);
+        }
+
+        public static void SaveClientErrorReport(SConnection connection, C.ClientErrorReport report)
+        {
+            if (report == null) return;
+
+            string contents =
+                $"Time (UTC): {report.ErrorTime:O}{Environment.NewLine}" +
+                $"Account: {connection?.Account?.EMailAddress ?? "Unknown"}{Environment.NewLine}" +
+                $"Character: {connection?.Player?.Name ?? "Unknown"}{Environment.NewLine}" +
+                $"IP: {connection?.IPAddress ?? "Unknown"}{Environment.NewLine}" +
+                $"Client Version: {report.ClientVersion ?? "Unknown"}{Environment.NewLine}" +
+                $"Summary: {report.Summary ?? string.Empty}{Environment.NewLine}" +
+                $"{Environment.NewLine}" +
+                $"{report.Details ?? string.Empty}";
+
+            Log($"Client error report received from {connection?.Account?.EMailAddress ?? connection?.IPAddress ?? "unknown client"}: {report.Summary}");
+
+            if (Config.SaveClientErrorReports)
+                SaveTextReport(Config.ClientErrorReportPath, "client-error", contents);
+
+            if (Config.EmailClientErrorReports)
+            {
+                string recipient = string.IsNullOrWhiteSpace(Config.ClientErrorReportRecipient) ? Config.MailFrom : Config.ClientErrorReportRecipient;
+                EmailService.SendClientErrorReport(recipient, $"Zircon client error: {report.Summary}", contents);
+            }
         }
 
         public static void LoadExperienceList()
@@ -1091,7 +1182,16 @@ namespace Server.Envir
 
                         connection = Connections[i];
 
-                        connection.Process();
+                        try
+                        {
+                            connection.Process();
+                        }
+                        catch (Exception ex)
+                        {
+                            HandleConnectionFailure(connection, ex, "connection processing");
+                            continue;
+                        }
+
                         bytesSent += connection.TotalBytesSent;
                         bytesReceived += connection.TotalBytesReceived;
                     }
@@ -1101,7 +1201,18 @@ namespace Server.Envir
                         conDelay = delay;
 
                     for (int i = Players.Count - 1; i >= 0; i--)
-                        Players[i].StartProcess();
+                    {
+                        PlayerObject player = Players[i];
+
+                        try
+                        {
+                            player.StartProcess();
+                        }
+                        catch (Exception ex)
+                        {
+                            HandlePlayerFailure(player, ex, "player processing");
+                        }
+                    }
 
                     TotalBytesSent = DBytesSent + bytesSent;
                     TotalBytesReceived = DBytesReceived + bytesReceived;
@@ -1201,16 +1312,46 @@ namespace Server.Envir
                             {
                                 if (!timer.Started) continue;
 
-                                EventHandler.Process(timer.Player, "TIMERMINUTE");
+                                try
+                                {
+                                    EventHandler.Process(timer.Player, "TIMERMINUTE");
+                                }
+                                catch (Exception ex)
+                                {
+                                    HandleLoopFailure("event timer processing", ex);
+                                }
                             }
                         }
 
-                        CalculateLights();
+                        try
+                        {
+                            CalculateLights();
+                        }
+                        catch (Exception ex)
+                        {
+                            HandleLoopFailure("light calculation", ex);
+                        }
 
-                        CheckGuildWars();
+                        try
+                        {
+                            CheckGuildWars();
+                        }
+                        catch (Exception ex)
+                        {
+                            HandleLoopFailure("guild war checks", ex);
+                        }
 
                         foreach (KeyValuePair<MapInfo, Map> pair in Maps)
-                            pair.Value.Process();
+                        {
+                            try
+                            {
+                                pair.Value.Process();
+                            }
+                            catch (Exception ex)
+                            {
+                                HandleMapFailure(pair.Value, ex, "map processing");
+                            }
+                        }
 
                         foreach (var instance in Instances)
                         {
@@ -1222,7 +1363,14 @@ namespace Server.Envir
 
                                 foreach (KeyValuePair<MapInfo, Map> pair in instance.Value[instanceSequence])
                                 {
-                                    pair.Value.Process();
+                                    try
+                                    {
+                                        pair.Value.Process();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        HandleMapFailure(pair.Value, ex, "instance map processing");
+                                    }
 
                                     if (pair.Value.InstanceExpiry != DateTime.MinValue && pair.Value.InstanceExpiry < Now)
                                     {
@@ -1239,18 +1387,52 @@ namespace Server.Envir
                         }
 
                         foreach (SpawnInfo spawn in Spawns)
-                            spawn.DoSpawn(false);
+                        {
+                            try
+                            {
+                                spawn.DoSpawn(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                HandleLoopFailure("spawn processing", ex);
+                            }
+                        }
 
                         for (int i = ConquestWars.Count - 1; i >= 0; i--)
-                            ConquestWars[i].Process();
+                        {
+                            try
+                            {
+                                ConquestWars[i].Process();
+                            }
+                            catch (Exception ex)
+                            {
+                                HandleLoopFailure("conquest processing", ex);
+                            }
+                        }
 
                         if (Config.EnableWebServer)
                         {
-                            WebServer.Process();
+                            try
+                            {
+                                WebServer.Process();
+                            }
+                            catch (Exception ex)
+                            {
+                                HandleLoopFailure("web server processing", ex);
+                            }
                         }
 
                         if (Config.ProcessGameGold)
-                            ProcessGameGold();
+                        {
+                            try
+                            {
+                                ProcessGameGold();
+                            }
+                            catch (Exception ex)
+                            {
+                                HandleLoopFailure("game gold processing", ex);
+                            }
+                        }
 
                         nextCount = Now.AddSeconds(1);
 

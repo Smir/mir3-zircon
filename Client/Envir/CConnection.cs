@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Reflection;
 using System.Windows.Forms;
 using C = Library.Network.ClientPackets;
 using G = Library.Network.GeneralPackets;
@@ -68,6 +69,25 @@ namespace Client.Envir
         public override void TrySendDisconnect(Packet p)
         {
             SendDisconnect(p);
+        }
+
+        public void SendClientErrorReport(Exception ex)
+        {
+            if (ex == null || Client?.Connected != true) return;
+
+            try
+            {
+                Client.Client.Send(new C.ClientErrorReport
+                {
+                    ErrorTime = DateTime.UtcNow,
+                    Summary = ex.Message,
+                    Details = ex.ToString(),
+                    ClientVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? string.Empty,
+                }.GetPacketBytes());
+            }
+            catch
+            {
+            }
         }
 
         public void Process(G.Disconnect p)
@@ -4990,4 +5010,3 @@ namespace Client.Envir
         }
     }
 }
-

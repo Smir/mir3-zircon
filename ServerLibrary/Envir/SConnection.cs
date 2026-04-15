@@ -285,6 +285,10 @@ namespace Server.Envir
             Stage = GameStage.Login;
             Enqueue(new G.GoodVersion() { DatabaseKey = Config.EncryptionEnabled ? SEnvir.CryptoKey : null });
         }
+        public void Process(C.ClientErrorReport p)
+        {
+            SEnvir.SaveClientErrorReport(this, p);
+        }
         public void Process(G.Ping p)
         {
             if (Stage == GameStage.None) return;

@@ -188,6 +188,14 @@ namespace Library.Network.ClientPackets
         public string Text { get; set; }
     }
 
+    public sealed class ClientErrorReport : Packet
+    {
+        public DateTime ErrorTime { get; set; }
+        public string Summary { get; set; }
+        public string Details { get; set; }
+        public string ClientVersion { get; set; }
+    }
+
     public sealed class NPCCall : Packet
     {
         public uint ObjectID { get; set; }

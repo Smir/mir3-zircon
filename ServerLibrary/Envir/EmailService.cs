@@ -3,6 +3,7 @@ using Server.DBModels;
 using System;
 using System.Net;
 using System.Net.Mail;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Server.Envir
@@ -232,6 +233,41 @@ namespace Server.Envir
 
                     message.Dispose();
                     client.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    SEnvir.Log(ex.Message);
+                    SEnvir.Log(ex.StackTrace);
+                }
+            });
+        }
+
+        public static void SendClientErrorReport(string recipient, string subject, string body)
+        {
+            if (string.IsNullOrWhiteSpace(recipient)) return;
+
+            EMailsSent++;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    using SmtpClient client = new SmtpClient(Config.MailServer, Config.MailPort)
+                    {
+                        EnableSsl = Config.MailUseSSL,
+                        UseDefaultCredentials = false,
+                        Credentials = new NetworkCredential(Config.MailAccount, Config.MailPassword),
+                    };
+
+                    using MailMessage message = new MailMessage(new MailAddress(Config.MailFrom, Config.MailDisplayName), new MailAddress(recipient))
+                    {
+                        Subject = subject,
+                        IsBodyHtml = false,
+                        BodyEncoding = Encoding.UTF8,
+                        Body = body,
+                    };
+
+                    client.Send(message);
                 }
                 catch (Exception ex)
                 {

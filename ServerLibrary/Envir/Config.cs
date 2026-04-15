@@ -89,6 +89,10 @@ namespace Server.Envir
         public static string ReceiverEMail { get; set; } = @"REDACTED";
         public static bool ProcessGameGold { get; set; } = true;
         public static bool AllowBuyGameGold { get; set; } = true;
+        public static bool SaveClientErrorReports { get; set; } = true;
+        public static string ClientErrorReportPath { get; set; } = @".\ErrorReports\Client\";
+        public static bool EmailClientErrorReports { get; set; } = false;
+        public static string ClientErrorReportRecipient { get; set; } = string.Empty;
 
 
         [ConfigSection("Players")]

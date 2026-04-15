@@ -10,5 +10,6 @@ namespace Launcher
         public static bool UseLogin { get; set; }
         public static string Username { get; set; }
         public static string Password { get; set; }
+        public static int MaxConcurrentDownloads { get; set; } = 4;
     }
 }
